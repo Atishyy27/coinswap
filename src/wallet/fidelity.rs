@@ -272,13 +272,10 @@ fn read_pubkey_from_fidelity_script(redeemscript: &ScriptBuf) -> Result<PublicKe
     }
 }
 
-/// Calculates the theoretical fidelity bond value. Refer [The OG Fidelity Bond Paper by Chris Belcher.]<https://gist.github.com/chris-belcher/87ebbcbb639686057a389acb9ab3e25b#financial-mathematics-of-joinmarket-fidelity-bonds>
 /// When a bond matures, as a timestamp.
 ///
-/// A fidelity locktime is height-based: `encode_fidelity_op_return` refuses to
-/// build a bond any other way and `verify_fidelity_checks` rejects one whose
-/// locktime is not a height. A seconds-based locktime is refused here too,
-/// rather than read as a maturity time it is not.
+/// A fidelity locktime is height-based everywhere else it is handled, so a
+/// seconds-based one is refused rather than read as a maturity time.
 fn bond_maturity_time(
     lock_time: LockTime,
     tip_height: u64,
@@ -298,6 +295,7 @@ fn bond_maturity_time(
     }
 }
 
+/// Calculates the theoretical fidelity bond value. Refer [The OG Fidelity Bond Paper by Chris Belcher.]<https://gist.github.com/chris-belcher/87ebbcbb639686057a389acb9ab3e25b#financial-mathematics-of-joinmarket-fidelity-bonds>
 fn calculate_fidelity_value(
     value: Amount,          // Bond amount in sats
     locktime: u64,          // Bond locktime timestamp
