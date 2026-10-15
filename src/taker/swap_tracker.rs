@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
     fmt,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
 };
@@ -500,8 +501,32 @@ impl SwapTracker {
         let bytes = serde_cbor::to_vec(&self.data)
             .map_err(|e| TakerError::General(format!("Failed to serialize swap tracker: {}", e)))?;
 
-        std::fs::write(&tmp_path, &bytes)?;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        // Closed before the rename, as `fs::write` left it.
+        drop(file);
+
         std::fs::rename(&tmp_path, &self.path)?;
+
+        // Without a directory sync, a power loss can undo the rename after `Ok` returned.
+        // A sync failure only leaves durability unconfirmed; the rename already happened.
+        #[cfg(unix)]
+        {
+            let parent = self.path.parent().unwrap_or_else(|| Path::new(""));
+            let directory = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if let Err(error) = std::fs::File::open(directory).and_then(|dir| dir.sync_all()) {
+                log::warn!(
+                    "Could not sync {} after writing {}: {error}",
+                    directory.display(),
+                    self.path.display()
+                );
+            }
+        }
 
         Ok(())
     }
