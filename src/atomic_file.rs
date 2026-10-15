@@ -69,10 +69,8 @@ pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io:
 
     std::fs::rename(&temporary_path, path)?;
 
-    // The rename is only durable once the directory entry reaches disk, so a power
-    // loss can otherwise keep the old file and lose a write that returned `Ok`.
-    // A failed sync means durability is unconfirmed, not that the write failed: the
-    // rename already happened, so say so and return success either way.
+    // Without a directory sync, a power loss can undo the rename after `Ok` returned.
+    // A sync failure only leaves durability unconfirmed; the rename already happened.
     #[cfg(unix)]
     {
         let parent = path.parent().unwrap_or_else(|| Path::new(""));
