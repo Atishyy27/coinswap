@@ -15,10 +15,12 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend},
+    maker::lightning_handlers::ADMIT_NEW_SWAP_OUTS,
     taker::{error::TakerError, lightning_swap::LnRoutedSwapParams},
     wallet::AddressType,
 };
 
+use super::{tx_fee, SpendFeerate};
 use crate::test_framework::*;
 
 /// One node per maker over a shared ledger, each with a ready channel to the
@@ -45,12 +47,15 @@ fn routed_nodes() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
     ],
 )]
 fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) {
+    // Hop 2 is a swap-out, so it needs the second maker to admit one.
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     // A handle of its own, so the node stays reachable while the taker is borrowed.
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let first_maker = world.makers()[0].address();
     let second_maker = world.makers()[1].address();
     let taker = world.taker_mut().inner_mut();
+    let _market = SpendFeerate::set(10.0);
 
     let report = taker
         .lightning_swap_routed(LnRoutedSwapParams {
@@ -84,6 +89,11 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
             .and_then(|info| info.confirmations)
             .unwrap_or(0)
             >= 1
+    );
+    assert_eq!(
+        tx_fee(bitcoind, &report.claim_txid),
+        Amount::from_sat(1_500),
+        "the hop-2 claim must pay the market rate, 10 sat/vB for 150 vB"
     );
 
     // Maker 1 learned the preimage over Lightning and swept hop 1: its
@@ -162,6 +172,8 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
     ],
 )]
 fn lightning_routed_swap_refuses_blocklisted_second_hop(world: &mut World) {
+    // Hop 2 is a swap-out, so it needs the second maker to admit one.
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let blocked_address = world.sole_regular_utxo_address(1);
     world
         .taker()
@@ -207,5 +219,64 @@ fn lightning_routed_swap_refuses_blocklisted_second_hop(world: &mut World) {
             && (line.contains("recovered via") || line.contains("already resolved"))),
         "hop 1 must be refunded, got: {:?}",
         history
+    );
+}
+
+/// With swap-out admission closed (#1239), a routed swap stops at its second
+/// hop, before the taker funds the first: hop 2 is a swap-out, which the
+/// second maker no longer offers. The taker never asks the first maker for
+/// an HTLC, so nothing is funded, recorded or left to recover on any side.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(ln1, ln2) = routed_nodes()],
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    maker_lightning = [ln1, ln2],
+    setup = [
+        fund_taker(3, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_routed_swap_is_refused_before_hop_one_funding(world: &mut World) {
+    let first = world.makers()[0].inner().clone();
+    let second = world.makers()[1].inner().clone();
+    let first_maker = world.makers()[0].address();
+    let second_maker = world.makers()[1].address();
+    let taker = world.taker_mut().inner_mut();
+
+    match taker.lightning_swap_routed(LnRoutedSwapParams {
+        amount: Amount::from_sat(40_000),
+        first_maker: Some(first_maker),
+        second_maker: Some(second_maker),
+        locktime: Some(60),
+        min_confirmations: 1,
+    }) {
+        Err(TakerError::General(reason)) => assert_eq!(
+            reason, "maker does not offer this swap direction",
+            "the second maker's offer must refuse hop 2"
+        ),
+        Err(other) => panic!("expected the second hop to be refused, got {:?}", other),
+        Ok(report) => panic!(
+            "a routed swap completed with admission closed: {:?}",
+            report
+        ),
+    }
+
+    // The taker writes its recovery records just before funding hop 1, so
+    // none existing means it funded nothing.
+    let outcomes = taker.recover_lightning_swaps().unwrap();
+    assert!(
+        outcomes.is_empty(),
+        "no lightning swap may be on record, got: {:?}",
+        outcomes
+    );
+    assert!(
+        first.ln_swaps.lock().unwrap().is_empty(),
+        "the first maker must never have been asked for hop 1"
+    );
+    assert!(
+        second.ln_swaps.lock().unwrap().is_empty(),
+        "the second maker must not have taken on hop 2"
     );
 }
